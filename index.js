@@ -4,17 +4,27 @@ import cors from 'cors';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Разрешаем CORS и JSON
 app.use(cors());
 app.use(express.json());
 
-// Простое in-memory хранилище
-// key: uuid, value: { uuid, nickname, modVersion, build, server, lastSeen }
+// ===== Онлайн-игроки с модом =====
+
+// key: uuid
+// value: { uuid, nickname, modVersion, build, server, lastSeen }
 const clients = new Map();
 
-// TTL (игрок считается "онлайн с модом", если обновлялся за последние N минут)
-const ONLINE_TTL_MS = 5 * 60 * 1000; // 5 минут
+// TTL (онлайн) — 5 минут
+const ONLINE_TTL_MS = 5 * 60 * 1000;
 
+// ===== База конфигов (share/load) =====
+
+// key: shareKey (строка), value: { key, ownerUuid, ownerNickname, config, createdAt, expiresAt }
+const sharedConfigs = new Map();
+
+// TTL ключей конфигов — 1 день
+const CONFIG_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Утилита очистки старых записей
 function cleanupOldClients() {
   const now = Date.now();
   for (const [uuid, data] of clients.entries()) {
@@ -24,19 +34,44 @@ function cleanupOldClients() {
   }
 }
 
-// Периодическая очистка
-setInterval(cleanupOldClients, 60 * 1000);
+function cleanupOldConfigs() {
+  const now = Date.now();
+  for (const [key, data] of sharedConfigs.entries()) {
+    if (now > data.expiresAt) {
+      sharedConfigs.delete(key);
+    }
+  }
+}
 
-// Простой healthcheck
+setInterval(() => {
+  cleanupOldClients();
+  cleanupOldConfigs();
+}, 60 * 1000);
+
+// Простая генерация ключа
+function generateShareKey(length = 8) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // без похожих символов
+  let key = '';
+  for (let i = 0; i < length; i++) {
+    key += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return key;
+}
+
+// ===== Эндпоинты =====
+
+// Healthcheck
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     onlineClients: clients.size,
-    ttlMinutes: ONLINE_TTL_MS / 60000
+    sharedConfigs: sharedConfigs.size,
+    onlineTtlMinutes: ONLINE_TTL_MS / 60000,
+    configTtlHours: CONFIG_TTL_MS / 3600000
   });
 });
 
-// Клиент с модом сообщает о себе
+// Presence от клиента
 app.post('/presence', (req, res) => {
   try {
     const { uuid, nickname, modVersion, build, server } = req.body || {};
@@ -68,7 +103,7 @@ app.post('/presence', (req, res) => {
   }
 });
 
-// Клиент спрашивает: у кого из этих ников есть мод
+// Список, у кого есть мод (по никам)
 app.post('/who-has-mod', (req, res) => {
   try {
     const { players, server } = req.body || {};
@@ -85,7 +120,6 @@ app.post('/who-has-mod', (req, res) => {
     const meta = {};
 
     for (const data of clients.values()) {
-      // Если хочешь учитывать сервер, раскомментируй условие ниже
       if (server && data.server && data.server !== server) continue;
 
       if (normalizedPlayers.includes(data.nickname)) {
@@ -105,7 +139,89 @@ app.post('/who-has-mod', (req, res) => {
   }
 });
 
-// Запуск сервера
+// ===== Share config =====
+// Клиент шлёт свой текущий конфиг (JSON), сервер выдаёт ключ, который живёт 1 день
+
+app.post('/config/share', (req, res) => {
+  try {
+    const { uuid, nickname, config } = req.body || {};
+    if (!uuid || !nickname || !config) {
+      return res.status(400).json({ error: 'uuid, nickname and config are required' });
+    }
+
+    // config — произвольный JSON объект с настройками мода
+    const now = Date.now();
+    const expiresAt = now + CONFIG_TTL_MS;
+
+    // Генерируем уникальный ключ
+    let key;
+    do {
+      key = generateShareKey(8);
+    } while (sharedConfigs.has(key));
+
+    sharedConfigs.set(key, {
+      key,
+      ownerUuid: uuid,
+      ownerNickname: nickname,
+      config,
+      createdAt: now,
+      expiresAt
+    });
+
+    console.log(
+      `[CONFIG_SHARE] ${nickname} (${uuid}) shared config with key ${key}, expires at ${new Date(
+        expiresAt
+      ).toISOString()}`
+    );
+
+    return res.json({
+      ok: true,
+      key,
+      expiresAt
+    });
+  } catch (e) {
+    console.error('Error in /config/share:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ===== Load config =====
+// Клиент присылает ключ, сервер если находит и не просрочен — возвращает config
+
+app.post('/config/load', (req, res) => {
+  try {
+    const { key } = req.body || {};
+    if (!key) {
+      return res.status(400).json({ error: 'key is required' });
+    }
+
+    const entry = sharedConfigs.get(String(key).trim().toUpperCase());
+    const now = Date.now();
+
+    if (!entry) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+
+    if (now > entry.expiresAt) {
+      sharedConfigs.delete(entry.key);
+      return res.status(410).json({ ok: false, error: 'expired' });
+    }
+
+    return res.json({
+      ok: true,
+      key: entry.key,
+      ownerUuid: entry.ownerUuid,
+      ownerNickname: entry.ownerNickname,
+      config: entry.config,
+      createdAt: entry.createdAt,
+      expiresAt: entry.expiresAt
+    });
+  } catch (e) {
+    console.error('Error in /config/load:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`MoonLord presence backend listening on port ${PORT}`);
+  console.log(`MoonLord backend listening on port ${PORT}`);
 });
