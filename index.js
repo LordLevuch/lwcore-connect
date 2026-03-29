@@ -7,93 +7,110 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ===== Онлайн-игроки с модом =====
-
+// ===== "БД" игроков с модом =====
+//
 // key: uuid
-// value: { uuid, nickname, modVersion, build, server, lastSeen }
-const clients = new Map();
+// value: {
+//   uuid,
+//   nickname,
+//   firstSeenAt,
+//   lastSeenAt,
+//   status,        // "online" | "menu" | "server" | "offline"
+//   currentServer, // string | null
+//   modVersion,
+//   build
+// }
+const players = new Map();
 
-// TTL (онлайн) — 5 минут
-const ONLINE_TTL_MS = 5 * 60 * 1000;
+// TTL для авто-оффлайна, если клиент пропал (например, игра закрыта без "выхода")
+const OFFLINE_TTL_MS = 10 * 60 * 1000; // 10 минут
 
-// ===== База конфигов (share/load) =====
-
-// key: shareKey (строка), value: { key, ownerUuid, ownerNickname, config, createdAt, expiresAt }
-const sharedConfigs = new Map();
-
-// TTL ключей конфигов — 1 день
-const CONFIG_TTL_MS = 24 * 60 * 60 * 1000;
-
-// Утилита очистки старых записей
-function cleanupOldClients() {
+function cleanupOfflineByTtl() {
   const now = Date.now();
-  for (const [uuid, data] of clients.entries()) {
-    if (now - data.lastSeen > ONLINE_TTL_MS) {
-      clients.delete(uuid);
+  for (const [uuid, data] of players.entries()) {
+    if (data.status === 'online' || data.status === 'menu' || data.status === 'server') {
+      if (now - data.lastSeenAt > OFFLINE_TTL_MS) {
+        data.status = 'offline';
+        data.currentServer = null;
+        players.set(uuid, data);
+        console.log(
+          `[TTL] Marked ${data.nickname} (${uuid}) as offline due to inactivity (lastSeenAt ${
+            new Date(data.lastSeenAt).toISOString()
+          })`
+        );
+      }
     }
   }
 }
 
-function cleanupOldConfigs() {
-  const now = Date.now();
-  for (const [key, data] of sharedConfigs.entries()) {
-    if (now > data.expiresAt) {
-      sharedConfigs.delete(key);
-    }
-  }
-}
-
-setInterval(() => {
-  cleanupOldClients();
-  cleanupOldConfigs();
-}, 60 * 1000);
-
-// Простая генерация ключа
-function generateShareKey(length = 8) {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // без похожих символов
-  let key = '';
-  for (let i = 0; i < length; i++) {
-    key += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return key;
-}
-
-// ===== Эндпоинты =====
+setInterval(cleanupOfflineByTtl, 60 * 1000);
 
 // Healthcheck
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
-    onlineClients: clients.size,
-    sharedConfigs: sharedConfigs.size,
-    onlineTtlMinutes: ONLINE_TTL_MS / 60000,
-    configTtlHours: CONFIG_TTL_MS / 3600000
+    totalPlayers: players.size,
+    online: Array.from(players.values()).filter(p => p.status !== 'offline').length
   });
 });
 
-// Presence от клиента
+/**
+ * POST /presence
+ *
+ * Клиент шлёт:
+ * {
+ *   "uuid": "...",
+ *   "nickname": "...",
+ *   "modVersion": "1.0",
+ *   "build": 3,
+ *   "state": "online" | "menu" | "server" | "offline",
+ *   "server": "mc.example.com:25565" // только если state === "server"
+ * }
+ *
+ * Назначение:
+ *  - обновить/создать запись игрока
+ *  - обновить статус (online/menu/server/offline)
+ */
 app.post('/presence', (req, res) => {
   try {
-    const { uuid, nickname, modVersion, build, server } = req.body || {};
+    const { uuid, nickname, modVersion, build, state, server } = req.body || {};
     if (!uuid || !nickname) {
       return res.status(400).json({ error: 'uuid and nickname are required' });
     }
 
     const now = Date.now();
+    const normalizedState = ['online', 'menu', 'server', 'offline'].includes(state)
+      ? state
+      : 'online';
 
-    clients.set(uuid, {
-      uuid,
-      nickname: String(nickname),
-      modVersion: modVersion ? String(modVersion) : 'unknown',
-      build: typeof build === 'number' ? build : null,
-      server: server ? String(server) : null,
-      lastSeen: now
-    });
+    let existing = players.get(uuid);
+    if (!existing) {
+      existing = {
+        uuid,
+        nickname: String(nickname),
+        firstSeenAt: now,
+        lastSeenAt: now,
+        status: normalizedState,
+        currentServer: normalizedState === 'server' ? String(server || '') || null : null,
+        modVersion: modVersion ? String(modVersion) : 'unknown',
+        build: typeof build === 'number' ? build : null
+      };
+    } else {
+      existing.nickname = String(nickname);
+      existing.lastSeenAt = now;
+      existing.status = normalizedState;
+      existing.currentServer =
+        normalizedState === 'server' ? (server ? String(server) : null) : null;
+      existing.modVersion = modVersion ? String(modVersion) : existing.modVersion;
+      existing.build = typeof build === 'number' ? build : existing.build;
+    }
+
+    players.set(uuid, existing);
 
     console.log(
-      `[PRESENCE] ${nickname} (${uuid}) v${modVersion || 'unknown'} build ${build ?? '?'} @ ${
-        server || 'unknown'
-      }`
+      `[PRESENCE] ${existing.nickname} (${uuid}) state=${existing.status} server=${
+        existing.currentServer || '-'
+      } v${existing.modVersion} build ${existing.build ?? '?'}`
     );
 
     return res.json({ ok: true, timestamp: now });
@@ -103,33 +120,52 @@ app.post('/presence', (req, res) => {
   }
 });
 
-// Список, у кого есть мод (по никам)
+/**
+ * POST /who-has-mod
+ *
+ * Тело:
+ * {
+ *   "players": ["Nick1", "Nick2", "LordLevuch"],
+ *   "server": "mc.example.com:25565" // опционально
+ * }
+ *
+ * Ответ:
+ * {
+ *   "withMod": ["Nick2", "LordLevuch"],
+ *   "meta": {
+ *     "Nick2": { "status": "server", "currentServer": "mc...", "modVersion": "...", "build": 3, "lastSeenAt": 123 },
+ *     "LordLevuch": { ... }
+ *   },
+ *   "now": 123
+ * }
+ */
 app.post('/who-has-mod', (req, res) => {
   try {
-    const { players, server } = req.body || {};
-    if (!Array.isArray(players)) {
+    const { players: nicknames, server } = req.body || {};
+    if (!Array.isArray(nicknames)) {
       return res.status(400).json({ error: 'players must be array' });
     }
 
     const now = Date.now();
-    cleanupOldClients();
-
-    const normalizedPlayers = players.map(p => String(p).trim()).filter(Boolean);
+    const normalized = nicknames.map(p => String(p).trim()).filter(Boolean);
 
     const withMod = [];
     const meta = {};
 
-    for (const data of clients.values()) {
-      if (server && data.server && data.server !== server) continue;
+    for (const p of players.values()) {
+      if (!normalized.includes(p.nickname)) continue;
+      // если хотим фильтровать по серверу:
+      if (server && p.currentServer && p.currentServer !== server) continue;
+      if (p.status === 'offline') continue;
 
-      if (normalizedPlayers.includes(data.nickname)) {
-        withMod.push(data.nickname);
-        meta[data.nickname] = {
-          modVersion: data.modVersion,
-          build: data.build,
-          lastSeen: data.lastSeen
-        };
-      }
+      withMod.push(p.nickname);
+      meta[p.nickname] = {
+        status: p.status,
+        currentServer: p.currentServer,
+        modVersion: p.modVersion,
+        build: p.build,
+        lastSeenAt: p.lastSeenAt
+      };
     }
 
     return res.json({ withMod, meta, now });
@@ -139,89 +175,6 @@ app.post('/who-has-mod', (req, res) => {
   }
 });
 
-// ===== Share config =====
-// Клиент шлёт свой текущий конфиг (JSON), сервер выдаёт ключ, который живёт 1 день
-
-app.post('/config/share', (req, res) => {
-  try {
-    const { uuid, nickname, config } = req.body || {};
-    if (!uuid || !nickname || !config) {
-      return res.status(400).json({ error: 'uuid, nickname and config are required' });
-    }
-
-    // config — произвольный JSON объект с настройками мода
-    const now = Date.now();
-    const expiresAt = now + CONFIG_TTL_MS;
-
-    // Генерируем уникальный ключ
-    let key;
-    do {
-      key = generateShareKey(8);
-    } while (sharedConfigs.has(key));
-
-    sharedConfigs.set(key, {
-      key,
-      ownerUuid: uuid,
-      ownerNickname: nickname,
-      config,
-      createdAt: now,
-      expiresAt
-    });
-
-    console.log(
-      `[CONFIG_SHARE] ${nickname} (${uuid}) shared config with key ${key}, expires at ${new Date(
-        expiresAt
-      ).toISOString()}`
-    );
-
-    return res.json({
-      ok: true,
-      key,
-      expiresAt
-    });
-  } catch (e) {
-    console.error('Error in /config/share:', e);
-    return res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-// ===== Load config =====
-// Клиент присылает ключ, сервер если находит и не просрочен — возвращает config
-
-app.post('/config/load', (req, res) => {
-  try {
-    const { key } = req.body || {};
-    if (!key) {
-      return res.status(400).json({ error: 'key is required' });
-    }
-
-    const entry = sharedConfigs.get(String(key).trim().toUpperCase());
-    const now = Date.now();
-
-    if (!entry) {
-      return res.status(404).json({ ok: false, error: 'not_found' });
-    }
-
-    if (now > entry.expiresAt) {
-      sharedConfigs.delete(entry.key);
-      return res.status(410).json({ ok: false, error: 'expired' });
-    }
-
-    return res.json({
-      ok: true,
-      key: entry.key,
-      ownerUuid: entry.ownerUuid,
-      ownerNickname: entry.ownerNickname,
-      config: entry.config,
-      createdAt: entry.createdAt,
-      expiresAt: entry.expiresAt
-    });
-  } catch (e) {
-    console.error('Error in /config/load:', e);
-    return res.status(500).json({ error: 'internal_error' });
-  }
-});
-
 app.listen(PORT, () => {
-  console.log(`MoonLord backend listening on port ${PORT}`);
+  console.log(`MoonLord backend (players DB) listening on port ${PORT}`);
 });
