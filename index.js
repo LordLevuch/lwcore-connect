@@ -23,7 +23,7 @@ app.use(express.json());
 const players = new Map();
 
 // TTL для авто-оффлайна, если клиент пропал
-const OFFLINE_TTL_MS = 10 * 60 * 1000; // 10 минут
+const OFFLINE_TTL_MS = 60 * 60 * 1000; // 10 минут
 
 // ===== База конфигов (share/load) =====
 //
